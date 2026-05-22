@@ -16,12 +16,26 @@ class ChunkMetadata(BaseModel):
 class Citation(BaseModel):
     filename: str
     page_number: int
+    chunk_id: Optional[str] = None
+    source_type: Optional[str] = None
     text_snippet: str
     relevance_score: float
+
+class RetrievedChunk(BaseModel):
+    filename: str
+    page_number: int
+    chunk_id: Optional[str] = None
+    source_type: Optional[str] = None
+    extraction_mode: Optional[str] = None
+    text: str
+    score: Optional[float] = None
+    dense_score: Optional[float] = None
+    lexical_score: Optional[float] = None
 
 class QueryResponse(BaseModel):
     answer: str
     citations: List[Citation]
+    retrieved_chunks: List[RetrievedChunk] = []
     latency_ms: Dict[str, float]
 
 class IngestResponse(BaseModel):

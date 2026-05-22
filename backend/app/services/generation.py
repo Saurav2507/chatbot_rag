@@ -1,79 +1,96 @@
-import os
 import logging
+import os
 import time
-from huggingface_hub import hf_hub_download
-from llama_cpp import Llama
+
+from app.core.config import settings
 
 logger = logging.getLogger(__name__)
 
+
 class LLMGenerator:
     def __init__(self):
-        # Configurable via .env — defaults to smaller, faster 3B model
-        repo_id = os.getenv("LLM_REPO_ID", "bartowski/Qwen2.5-3B-Instruct-GGUF")
-        filename = os.getenv("LLM_FILENAME", "Qwen2.5-3B-Instruct-Q4_K_M.gguf")
-        n_ctx = int(os.getenv("LLM_N_CTX", "2048"))
-        n_threads = int(os.getenv("LLM_N_THREADS", "0")) or os.cpu_count()
-        
-        logger.info(f"Loading LLM: {repo_id} / {filename}")
-        logger.info(f"  n_ctx={n_ctx}, n_threads={n_threads}")
-        
+        os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
+        repo_id = settings.llm_repo_id
+        filename = settings.llm_filename
+
+        logger.info("Loading CPU LLM: %s / %s", repo_id, filename)
+        logger.info("LLM runtime: n_ctx=%s, n_threads=%s, n_gpu_layers=0", settings.llm_n_ctx, settings.llm_n_threads)
+
         try:
+            from huggingface_hub import hf_hub_download
+
             t0 = time.time()
             model_path = hf_hub_download(repo_id=repo_id, filename=filename)
-            logger.info(f"Model downloaded/cached in {time.time() - t0:.1f}s")
-        except Exception as e:
-            logger.error(f"Failed to download model: {e}")
-            raise e
+            logger.info("Model downloaded/cached in %.1fs", time.time() - t0)
+        except ImportError as exc:
+            raise RuntimeError(
+                "huggingface-hub is required to load the GGUF model. "
+                "Install backend dependencies with: pip install -r backend/requirements.txt"
+            ) from exc
+        except Exception as exc:
+            logger.error("Failed to download/load model metadata: %s", exc)
+            raise
 
-        # Initialize Llama.cpp with optimized settings
+        try:
+            from llama_cpp import Llama
+        except ImportError as exc:
+            raise RuntimeError(
+                "llama-cpp-python is required for CPU generation. "
+                "Install backend dependencies with: pip install -r backend/requirements.txt"
+            ) from exc
+
         self.llm = Llama(
             model_path=model_path,
-            n_ctx=n_ctx,
-            n_threads=n_threads,
-            verbose=False
+            n_ctx=settings.llm_n_ctx,
+            n_threads=settings.llm_n_threads,
+            n_gpu_layers=0,
+            verbose=False,
         )
-        self.max_tokens = int(os.getenv("LLM_MAX_TOKENS", "512"))
+        self.max_tokens = settings.llm_max_tokens
         logger.info("LLM loaded and ready.")
 
     def generate(self, prompt: str, system_message: str) -> str:
-        """Synchronous generation — returns full response."""
         messages = [
             {"role": "system", "content": system_message},
-            {"role": "user", "content": prompt}
+            {"role": "user", "content": prompt},
         ]
-        
+
         t0 = time.time()
         response = self.llm.create_chat_completion(
             messages=messages,
             max_tokens=self.max_tokens,
             temperature=0.1,
-            top_p=0.9
+            top_p=0.9,
         )
-        elapsed = (time.time() - t0) * 1000
-        logger.info(f"LLM generation: {elapsed:.0f}ms")
-        return response["choices"][0]["message"]["content"]
+        logger.info("LLM generation: %.0fms", (time.time() - t0) * 1000)
+        return response["choices"][0]["message"]["content"].strip()
 
     def generate_stream(self, prompt: str, system_message: str):
-        """Streaming generation — yields token strings as they are produced.
-        This allows the frontend to display tokens in real-time."""
         messages = [
             {"role": "system", "content": system_message},
-            {"role": "user", "content": prompt}
+            {"role": "user", "content": prompt},
         ]
-        
+
         response = self.llm.create_chat_completion(
             messages=messages,
             max_tokens=self.max_tokens,
             temperature=0.1,
             top_p=0.9,
-            stream=True
+            stream=True,
         )
-        
+
         for chunk in response:
             delta = chunk["choices"][0].get("delta", {})
             token = delta.get("content", "")
             if token:
                 yield token
 
-# Singleton
-llm_generator = LLMGenerator()
+
+_llm_generator: LLMGenerator | None = None
+
+
+def get_llm_generator() -> LLMGenerator:
+    global _llm_generator
+    if _llm_generator is None:
+        _llm_generator = LLMGenerator()
+    return _llm_generator

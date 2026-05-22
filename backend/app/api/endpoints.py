@@ -1,81 +1,96 @@
-import os
 import logging
 import shutil
-from fastapi import APIRouter, UploadFile, File, BackgroundTasks
-from fastapi.responses import JSONResponse
+from pathlib import Path
+
+from fastapi import APIRouter, BackgroundTasks, File, HTTPException, UploadFile
 from sse_starlette.sse import EventSourceResponse
-from typing import List
-from app.models.schemas import QueryRequest, QueryResponse, IngestResponse
-from app.services.ingestion import process_pdf
-from app.services.chunking import create_chunks_with_metadata
-from app.services.embeddings import bge_models
-from app.db.qdrant_client import insert_chunks
-from app.services.retrieval import retrieve_and_generate, retrieve_and_generate_stream
+
+from app.core.config import settings
+from app.models.schemas import IngestResponse, QueryRequest, QueryResponse
+from app.services.ingestion import ingest_document, ingest_folder as ingest_folder_service
+from app.services.loaders import SUPPORTED_EXTENSIONS, iter_supported_documents
+from app.services.retrieval import retrieve_and_generate, retrieve_and_generate_stream, retrieve_chunks
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
+UPLOAD_DIR = settings.data_dir
+UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
-UPLOAD_DIR = "data"
-os.makedirs(UPLOAD_DIR, exist_ok=True)
 
 def background_ingest(file_path: str, filename: str):
-    logger.info(f"Starting ingestion for {filename}")
-    # 1. Extract text
-    pages_data = process_pdf(file_path)
-    
-    # 2. Chunk text
-    chunks = create_chunks_with_metadata(pages_data, filename)
-    
-    # 3. Embed chunks in batches to avoid OOM
-    batch_size = 32
-    for i in range(0, len(chunks), batch_size):
-        batch = chunks[i:i + batch_size]
-        texts = [c["text"] for c in batch]
-        embeddings = bge_models.embed_corpus(texts)
-        # 4. Insert into Qdrant
-        insert_chunks(batch, embeddings)
-        logger.info(f"  Ingested batch {i//batch_size + 1} ({len(batch)} chunks)")
-        
-    logger.info(f"Finished ingestion for {filename}. Inserted {len(chunks)} chunks.")
+    try:
+        ingest_document(file_path, replace_existing=True)
+    except Exception as exc:
+        logger.exception("Failed ingestion for %s: %s", filename, exc)
+
 
 @router.post("/upload", response_model=IngestResponse)
-async def upload_pdf(background_tasks: BackgroundTasks, file: UploadFile = File(...)):
-    file_path = os.path.join(UPLOAD_DIR, file.filename)
-    with open(file_path, "wb") as buffer:
-        shutil.copyfileobj(file.file, buffer)
-        
-    # Kick off ingestion in background
-    background_tasks.add_task(background_ingest, file_path, file.filename)
-    
-    return IngestResponse(
-        status="processing",
-        total_pages=0,
-        total_chunks=0,
-        filename=file.filename
-    )
+async def upload_document(background_tasks: BackgroundTasks, file: UploadFile = File(...)):
+    filename = Path(file.filename or "").name
+    if Path(filename).suffix.lower() not in SUPPORTED_EXTENSIONS:
+        raise HTTPException(status_code=400, detail="Only PDF, TXT, and DOCX files are supported.")
 
-@router.post("/chat", response_model=QueryResponse)
-async def chat(request: QueryRequest):
-    """Synchronous chat — returns full response at once."""
-    result = retrieve_and_generate(request.query, request.top_k)
-    return QueryResponse(**result)
+    file_path = UPLOAD_DIR / filename
+    with file_path.open("wb") as buffer:
+        shutil.copyfileobj(file.file, buffer)
+
+    background_tasks.add_task(background_ingest, str(file_path), filename)
+    return IngestResponse(status="processing", total_pages=0, total_chunks=0, filename=filename)
+
+
+@router.post("/ingest_folder")
+async def ingest_folder(background_tasks: BackgroundTasks):
+    files = iter_supported_documents(UPLOAD_DIR)
+    if not files:
+        return {"message": f"No .pdf, .txt, or .docx documents found in {UPLOAD_DIR}."}
+
+    for file_path in files:
+        background_tasks.add_task(background_ingest, str(file_path), file_path.name)
+
+    return {"message": f"Started background ingestion for {len(files)} document(s) from {UPLOAD_DIR}."}
+
+
+@router.post("/ingest_now")
+def ingest_now():
+    """Synchronous ingestion, useful for scripts and tests."""
+    results = ingest_folder_service(UPLOAD_DIR, replace_existing=True)
+    return {"results": results}
+
+
+@router.post("/retrieve")
+def retrieve(request: QueryRequest):
+    return retrieve_chunks(request.query, request.top_k)
+
+
+@router.post("/chat")
+def chat(request: QueryRequest):
+    try:
+        res = retrieve_and_generate(request.query, request.top_k)
+        QueryResponse(**res) # Test validation
+        return res
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+
 
 @router.post("/chat/stream")
-async def chat_stream(request: QueryRequest):
-    """Streaming chat via SSE — tokens arrive in real-time.
-    
-    Events:
-      - type=citations: source documents used
-      - type=token: each generated token
-      - type=done: final latency metrics
-    """
-    async def event_generator():
+def chat_stream(request: QueryRequest):
+    def event_generator():
         for event_data in retrieve_and_generate_stream(request.query, request.top_k):
             yield {"data": event_data}
-    
+
     return EventSourceResponse(event_generator())
+
 
 @router.get("/status")
 async def status():
-    return {"status": "online"}
+    return {
+        "status": "online",
+        "data_dir": str(UPLOAD_DIR),
+        "collection": settings.collection_name,
+        "embedding_model": settings.embedding_model_id,
+        "llm": f"{settings.llm_repo_id}/{settings.llm_filename}",
+        "device": "cpu",
+    }

@@ -1,44 +1,42 @@
-import fitz  # PyMuPDF
-import pytesseract
-from PIL import Image
-import io
-import re
+import logging
+from pathlib import Path
 
-def clean_text(text: str) -> str:
-    # Remove excessive newlines and normalize spaces
-    text = re.sub(r'\n+', '\n', text)
-    text = re.sub(r'\s{2,}', ' ', text)
-    return text.strip()
+from app.services.chunking import create_chunks_with_metadata
+from app.services.indexing import index_chunks
+from app.services.loaders import iter_supported_documents, load_document
 
-def process_pdf(file_path: str) -> list[dict]:
-    """
-    Extracts text from PDF page by page.
-    Uses native text extraction first. If text length < 50 chars, uses OCR.
-    """
-    doc = fitz.open(file_path)
-    pages_data = []
+logger = logging.getLogger(__name__)
 
-    for page_num in range(len(doc)):
-        page = doc[page_num]
-        
-        # Try native text extraction
-        text = page.get_text("text")
-        extraction_mode = "native"
 
-        # Fallback to OCR if text is very short or missing
-        if len(text.strip()) < 50:
-            extraction_mode = "ocr"
-            pix = page.get_pixmap(dpi=300)
-            img = Image.open(io.BytesIO(pix.tobytes("png")))
-            text = pytesseract.image_to_string(img)
-            
-        text = clean_text(text)
-        
-        if len(text) > 10: # Only keep pages with some actual content
-            pages_data.append({
-                "page_number": page_num + 1, # 1-indexed
-                "text": text,
-                "extraction_mode": extraction_mode
-            })
-            
-    return pages_data
+def process_document(file_path: str | Path) -> list[dict]:
+    """Compatibility wrapper: load one supported document into page records."""
+    return load_document(file_path)
+
+
+def ingest_document(file_path: str | Path, replace_existing: bool = True) -> dict:
+    """Load, preprocess, chunk, embed, and index a single document."""
+    path = Path(file_path)
+    logger.info("Starting ingestion for %s", path.name)
+
+    pages = load_document(path)
+    if not pages:
+        logger.warning("No text extracted from %s", path.name)
+        return {"filename": path.name, "total_pages": 0, "total_chunks": 0, "status": "empty"}
+
+    chunks = create_chunks_with_metadata(pages, path.name)
+    indexed = index_chunks(chunks, path.name, replace_existing=replace_existing)
+    logger.info("Finished ingestion for %s: %s pages, %s chunks", path.name, len(pages), indexed)
+
+    return {
+        "filename": path.name,
+        "total_pages": len(pages),
+        "total_chunks": indexed,
+        "status": "indexed",
+    }
+
+
+def ingest_folder(folder: str | Path, replace_existing: bool = True) -> list[dict]:
+    results = []
+    for file_path in iter_supported_documents(folder):
+        results.append(ingest_document(file_path, replace_existing=replace_existing))
+    return results

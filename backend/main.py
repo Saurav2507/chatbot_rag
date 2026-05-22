@@ -15,7 +15,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.api.endpoints import router
 from app.db.qdrant_client import init_qdrant
 
-app = FastAPI(title="RAG Chatbot API")
+app = FastAPI(title="Sanskrit Document RAG API")
 
 app.add_middleware(
     CORSMiddleware,

@@ -1,14 +1,13 @@
-import os
 import logging
 from qdrant_client import QdrantClient
 from qdrant_client.http import models
+from app.core.config import settings
 
 logger = logging.getLogger(__name__)
 
-# Environment variable or default
-QDRANT_HOST = os.getenv("QDRANT_HOST", "localhost")
-QDRANT_PORT = int(os.getenv("QDRANT_PORT", "6333"))
-COLLECTION_NAME = os.getenv("COLLECTION_NAME", "pdf_knowledge_base")
+QDRANT_HOST = settings.qdrant_host
+QDRANT_PORT = settings.qdrant_port
+COLLECTION_NAME = settings.collection_name
 
 qdrant = QdrantClient(host=QDRANT_HOST, port=QDRANT_PORT)
 
@@ -16,14 +15,13 @@ def init_qdrant():
     """Initializes the Qdrant collection if it doesn't exist.
     Uses optimized HNSW parameters for faster search."""
     try:
-        qdrant.get_collection(collection_name=COLLECTION_NAME)
-        logger.info(f"Collection '{COLLECTION_NAME}' exists.")
+        collection = qdrant.get_collection(collection_name=COLLECTION_NAME)
     except Exception:
         logger.info(f"Creating collection '{COLLECTION_NAME}'...")
         qdrant.create_collection(
             collection_name=COLLECTION_NAME,
             vectors_config=models.VectorParams(
-                size=1024,
+                size=settings.embedding_dimension,
                 distance=models.Distance.COSINE,
             ),
             # Optimized HNSW index for faster search with good recall
@@ -37,6 +35,16 @@ def init_qdrant():
             ),
         )
         logger.info(f"Collection '{COLLECTION_NAME}' created with optimized HNSW.")
+        return
+
+    logger.info(f"Collection '{COLLECTION_NAME}' exists.")
+    vector_config = collection.config.params.vectors
+    if hasattr(vector_config, "size") and vector_config.size != settings.embedding_dimension:
+        raise RuntimeError(
+            f"Collection '{COLLECTION_NAME}' has vector size {vector_config.size}, "
+            f"but EMBEDDING_DIMENSION is {settings.embedding_dimension}. "
+            "Use a new COLLECTION_NAME or recreate the collection."
+        )
 
 def insert_chunks(chunks: list[dict], embeddings: list[list[float]]):
     """Inserts chunks with their embeddings into Qdrant."""
@@ -50,35 +58,69 @@ def insert_chunks(chunks: list[dict], embeddings: list[list[float]]):
                     "text": chunk["text"],
                     "filename": chunk["filename"],
                     "page_number": chunk["page_number"],
-                    "extraction_mode": chunk["extraction_mode"]
+                    "chunk_id": chunk["chunk_id"],
+                    "chunk_index": chunk.get("chunk_index"),
+                    "source_type": chunk.get("source_type", "pdf"),
+                    "extraction_mode": chunk.get("extraction_mode", "native"),
+                    "start_char": chunk.get("start_char"),
+                    "end_char": chunk.get("end_char"),
                 }
             )
         )
-    
+
     qdrant.upsert(
         collection_name=COLLECTION_NAME,
         points=points
     )
 
-def search_dense(query_embedding: list[float], top_k: int = 10, score_threshold: float = 0.3) -> list[dict]:
+
+def delete_source(filename: str) -> None:
+    """Remove existing chunks for a document before deterministic re-indexing."""
+    qdrant.delete(
+        collection_name=COLLECTION_NAME,
+        points_selector=models.FilterSelector(
+            filter=models.Filter(
+                must=[
+                    models.FieldCondition(
+                        key="filename",
+                        match=models.MatchValue(value=filename),
+                    )
+                ]
+            )
+        ),
+        wait=True,
+    )
+
+
+def search_dense(query_embedding: list[float], top_k: int = 10, score_threshold: float | None = None) -> list[dict]:
     """Searches Qdrant using dense vector search.
-    
-    Optimizations:
-    - score_threshold filters out low-relevance noise early
-    - with_payload selects only needed fields (avoids transferring large text unnecessarily)
-    - Reduced default top_k from 20 to 10
+    Falls back to no score threshold if the filtered search returns zero results.
     """
+    score_threshold = settings.retrieval_score_threshold if score_threshold is None else score_threshold
     search_result = qdrant.search(
         collection_name=COLLECTION_NAME,
         query_vector=query_embedding,
         limit=top_k,
         score_threshold=score_threshold,
-        with_payload=True,  # We need text for reranking
+        with_payload=True,
     )
-    
+
+    # Fallback: if score threshold filtered everything out, retry without threshold
+    if not search_result:
+        logger.warning(
+            "No results above score_threshold=%.2f — retrying without threshold", score_threshold
+        )
+        search_result = qdrant.search(
+            collection_name=COLLECTION_NAME,
+            query_vector=query_embedding,
+            limit=top_k,
+            score_threshold=None,
+            with_payload=True,
+        )
+
     results = []
     for hit in search_result:
-        doc = hit.payload
+        doc = dict(hit.payload)
         doc["score"] = hit.score
         results.append(doc)
     return results

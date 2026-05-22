@@ -1,165 +1,194 @@
-import os
-import time
 import json
 import logging
-from functools import lru_cache
-from app.services.embeddings import bge_models
+import time
+
+from app.core.config import settings
 from app.db.qdrant_client import search_dense
-from app.services.generation import llm_generator
+from app.services.embeddings import embedding_models
+from app.services.generation import get_llm_generator
+from app.services.preprocessing import normalize_sanskrit_text
+from app.services.reranking import lightweight_rerank
 
 logger = logging.getLogger(__name__)
 
-# Configurable defaults
-DEFAULT_RERANK_TOP_K = int(os.getenv("RERANK_TOP_K", "3"))
-DEFAULT_RETRIEVAL_TOP_K = int(os.getenv("RETRIEVAL_TOP_K", "10"))
-MAX_CHUNK_CHARS = 500  # Truncate chunk text sent to LLM to cap context size
-
 SYSTEM_MSG = (
-    "You are a reliable document analyst. "
-    "Answer the user's question using ONLY the provided context chunks. "
-    "If the answer is not contained in the context, say so clearly instead of guessing. "
-    "Every factual claim must include a citation in the exact format: [filename, page X]."
+    "You are a Sanskrit document question-answering assistant. "
+    "Use only the provided context chunks. If the answer is not supported by the context, "
+    "say that the available documents do not contain enough information. "
+    "Do not invent facts. Cite evidence as [filename, page X]."
 )
 
+
+def _chunk_label(chunk: dict) -> str:
+    return f"{chunk.get('filename', 'unknown')}, page {chunk.get('page_number', '?')}"
+
+
+def _estimate_tokens(text: str) -> int:
+    """Rough token estimate: ~4 chars per token on average for mixed Sanskrit/English."""
+    return max(1, len(text) // 4)
+
+
 def _build_prompt(query: str, top_chunks: list[dict]) -> str:
-    """Build a concise prompt with truncated chunks."""
-    context_parts = []
-    for i, c in enumerate(top_chunks):
-        text = c["text"][:MAX_CHUNK_CHARS]
-        context_parts.append(
-            f"[{i+1}] {c['filename']} p.{c['page_number']}: {text}"
-        )
-    context_str = "\n\n".join(context_parts)
-    return f"Context:\n{context_str}\n\nQuestion: {query}\n\nAnswer concisely with citations:"
+    """Build a context prompt that fits within the LLM context window.
 
-
-def _retrieve_chunks(query: str, retrieval_top_k: int, rerank_top_k: int) -> tuple:
-    """Core retrieval logic: embed → search → rerank. Returns (top_chunks, timing_dict)."""
-    timings = {}
-
-    # 1. Embed Query (cached for repeated queries)
-    t0 = time.time()
-    query_embedding = list(bge_models.embed_query(query))
-    timings["embedding"] = (time.time() - t0) * 1000
-
-    # 2. Retrieve candidates from Qdrant
-    t0 = time.time()
-    candidates = search_dense(query_embedding, top_k=retrieval_top_k)
-    timings["retrieval"] = (time.time() - t0) * 1000
-
-    if not candidates:
-        logger.warning("No candidates returned from Qdrant.")
-        return [], timings
-
-    # 3. Rerank candidates
-    t0 = time.time()
-    reranked = bge_models.rerank(query, candidates)
-    top_chunks = reranked[:rerank_top_k]
-    timings["reranking"] = (time.time() - t0) * 1000
-
-    return top_chunks, timings
-
-
-def retrieve_and_generate(query: str, top_k: int = None) -> dict:
-    """Full pipeline: retrieve + generate (synchronous)."""
-    rerank_top_k = top_k or DEFAULT_RERANK_TOP_K
-    start_time = time.time()
-    
-    top_chunks, timings = _retrieve_chunks(query, DEFAULT_RETRIEVAL_TOP_K, rerank_top_k)
-
-    if not top_chunks:
-        return {
-            "answer": "I couldn't find relevant information in the documents to answer your question.",
-            "citations": [],
-            "latency_ms": {**timings, "generation": 0, "total": (time.time() - start_time) * 1000}
-        }
-
-    # 4. Generate Answer
-    prompt = _build_prompt(query, top_chunks)
-    t0 = time.time()
-    answer = llm_generator.generate(prompt, SYSTEM_MSG)
-    timings["generation"] = (time.time() - t0) * 1000
-    timings["total"] = (time.time() - start_time) * 1000
-    
-    # Log all timings
-    logger.info(
-        f"Query latency breakdown: "
-        f"embed={timings['embedding']:.0f}ms, "
-        f"search={timings['retrieval']:.0f}ms, "
-        f"rerank={timings['reranking']:.0f}ms, "
-        f"gen={timings['generation']:.0f}ms, "
-        f"total={timings['total']:.0f}ms"
+    Reserves space for:
+      - System message overhead
+      - The question + fixed prompt text
+      - Output tokens (llm_max_tokens)
+    Progressively trims or drops chunks to ensure the total stays safe.
+    """
+    # Budget: context_window - output_tokens - system/question overhead
+    SYSTEM_OVERHEAD_TOKENS = _estimate_tokens(SYSTEM_MSG) + 64  # role tokens + safety margin
+    QUESTION_OVERHEAD = _estimate_tokens(query) + 32
+    max_prompt_tokens = (
+        settings.llm_n_ctx
+        - settings.llm_max_tokens
+        - SYSTEM_OVERHEAD_TOKENS
+        - QUESTION_OVERHEAD
+        - 64  # extra buffer
     )
-    
-    citations = [
-        {
-            "filename": c["filename"],
-            "page_number": c["page_number"],
-            "text_snippet": c["text"][:200] + "...",
-            "relevance_score": c.get("relevance_score", c.get("score", 0.0))
-        } for c in top_chunks
-    ]
-    
+    max_prompt_tokens = max(200, max_prompt_tokens)  # floor so we always try something
+
+    # Per-chunk cap (from settings, in chars)
+    char_cap = settings.max_context_chars_per_chunk
+
+    # Build parts greedily, dropping chunks that don't fit
+    used_tokens = 0
+    context_parts = []
+    for index, chunk in enumerate(top_chunks, start=1):
+        text = chunk["text"][:char_cap]
+        part = f"[{index}] Source: {_chunk_label(chunk)}\n{text}"
+        part_tokens = _estimate_tokens(part)
+        if used_tokens + part_tokens > max_prompt_tokens:
+            # Try trimming this chunk to whatever space is left
+            remaining_chars = max(0, (max_prompt_tokens - used_tokens) * 4 - 60)
+            if remaining_chars > 100:
+                text = chunk["text"][:remaining_chars]
+                part = f"[{index}] Source: {_chunk_label(chunk)}\n{text}"
+                context_parts.append(part)
+            break
+        context_parts.append(part)
+        used_tokens += part_tokens
+
+    if not context_parts:
+        # Last resort: just use first 200 chars of top chunk
+        text = top_chunks[0]["text"][:800]
+        context_parts.append(f"[1] Source: {_chunk_label(top_chunks[0])}\n{text}")
+
+    context_str = "\n\n".join(context_parts)
+    prompt = (
+        "Context chunks:\n"
+        f"{context_str}\n\n"
+        f"Question: {query}\n\n"
+        "Answer concisely. Include citations in the form [filename, page X]."
+    )
+    logger.debug("Prompt token estimate: ~%d / %d budget", _estimate_tokens(prompt), max_prompt_tokens)
+    return prompt
+
+
+def _citation(chunk: dict) -> dict:
+    snippet = chunk.get("text", "")[:240]
+    if len(chunk.get("text", "")) > 240:
+        snippet += "..."
     return {
-        "answer": answer,
-        "citations": citations,
-        "latency_ms": timings
+        "filename": chunk.get("filename", ""),
+        "page_number": chunk.get("page_number", 1),
+        "chunk_id": chunk.get("chunk_id"),
+        "source_type": chunk.get("source_type"),
+        "text_snippet": snippet,
+        "relevance_score": float(chunk.get("score", 0.0)),
     }
 
 
-def retrieve_and_generate_stream(query: str, top_k: int = None):
-    """Streaming variant: yields SSE-formatted events.
-    
-    Events:
-      - {"type": "citations", "data": [...]}   — sent first with source info
-      - {"type": "token", "data": "..."}       — each generated token
-      - {"type": "done", "data": {...}}        — final latency info
-    """
-    rerank_top_k = top_k or DEFAULT_RERANK_TOP_K
+def retrieve_chunks(query: str, top_k: int | None = None) -> dict:
+    retrieval_top_k = top_k or settings.retrieval_top_k
+    candidate_k = max(retrieval_top_k, settings.retrieval_candidate_k)
+    timings = {}
+
+    # embed_query handles normalization and transliteration variants internally
+    t0 = time.time()
+    query_embedding = embedding_models.embed_query(query)
+    timings["embedding"] = (time.time() - t0) * 1000
+
+    t0 = time.time()
+    candidates = search_dense(query_embedding, top_k=candidate_k)
+    timings["retrieval"] = (time.time() - t0) * 1000
+
+    t0 = time.time()
+    # Use the original query for lexical reranking so terms are preserved
+    chunks = lightweight_rerank(normalize_sanskrit_text(query), candidates, retrieval_top_k)
+    timings["reranking"] = (time.time() - t0) * 1000
+
+    return {"chunks": chunks, "latency_ms": timings}
+
+
+def retrieve_and_generate(query: str, top_k: int | None = None) -> dict:
     start_time = time.time()
-    
-    # Retrieve (non-streaming part)
-    top_chunks, timings = _retrieve_chunks(query, DEFAULT_RETRIEVAL_TOP_K, rerank_top_k)
+    retrieval = retrieve_chunks(query, top_k)
+    top_chunks = retrieval["chunks"]
+    timings = retrieval["latency_ms"]
 
     if not top_chunks:
-        yield json.dumps({
-            "type": "token",
-            "data": "I couldn't find relevant information in the documents to answer your question."
-        })
-        yield json.dumps({
-            "type": "done",
-            "data": {"latency_ms": {**timings, "generation": 0, "total": (time.time() - start_time) * 1000}}
-        })
+        timings["generation"] = 0
+        timings["total"] = (time.time() - start_time) * 1000
+        return {
+            "answer": "The available documents do not contain enough information to answer this question.",
+            "citations": [],
+            "retrieved_chunks": [],
+            "latency_ms": timings,
+        }
+
+    prompt = _build_prompt(query, top_chunks)
+    t0 = time.time()
+    answer = get_llm_generator().generate(prompt, SYSTEM_MSG)
+    timings["generation"] = (time.time() - t0) * 1000
+    timings["total"] = (time.time() - start_time) * 1000
+
+    logger.info(
+        "Query latency: embed=%.0fms, search=%.0fms, rerank=%.0fms, gen=%.0fms, total=%.0fms",
+        timings.get("embedding", 0),
+        timings.get("retrieval", 0),
+        timings.get("reranking", 0),
+        timings.get("generation", 0),
+        timings.get("total", 0),
+    )
+
+    citations = [_citation(chunk) for chunk in top_chunks]
+    return {
+        "answer": answer,
+        "citations": citations,
+        "retrieved_chunks": top_chunks,
+        "latency_ms": timings,
+    }
+
+
+def retrieve_and_generate_stream(query: str, top_k: int | None = None):
+    start_time = time.time()
+    retrieval = retrieve_chunks(query, top_k)
+    top_chunks = retrieval["chunks"]
+    timings = retrieval["latency_ms"]
+
+    if not top_chunks:
+        yield json.dumps(
+            {
+                "type": "token",
+                "data": "The available documents do not contain enough information to answer this question.",
+            }
+        )
+        timings["generation"] = 0
+        timings["total"] = (time.time() - start_time) * 1000
+        yield json.dumps({"type": "done", "data": {"latency_ms": timings}})
         return
 
-    # Send citations first so frontend can display sources immediately
-    citations = [
-        {
-            "filename": c["filename"],
-            "page_number": c["page_number"],
-            "text_snippet": c["text"][:200] + "...",
-            "relevance_score": c.get("relevance_score", c.get("score", 0.0))
-        } for c in top_chunks
-    ]
+    citations = [_citation(chunk) for chunk in top_chunks]
     yield json.dumps({"type": "citations", "data": citations})
+    yield json.dumps({"type": "chunks", "data": top_chunks})
 
-    # Stream generation tokens
     prompt = _build_prompt(query, top_chunks)
     gen_start = time.time()
-    
-    for token in llm_generator.generate_stream(prompt, SYSTEM_MSG):
+    for token in get_llm_generator().generate_stream(prompt, SYSTEM_MSG):
         yield json.dumps({"type": "token", "data": token})
-    
+
     timings["generation"] = (time.time() - gen_start) * 1000
     timings["total"] = (time.time() - start_time) * 1000
-    
-    logger.info(
-        f"[Stream] Query latency: "
-        f"embed={timings['embedding']:.0f}ms, "
-        f"search={timings['retrieval']:.0f}ms, "
-        f"rerank={timings['reranking']:.0f}ms, "
-        f"gen={timings['generation']:.0f}ms, "
-        f"total={timings['total']:.0f}ms"
-    )
-    
     yield json.dumps({"type": "done", "data": {"latency_ms": timings}})
